@@ -394,6 +394,155 @@ flask:
   environment: ...
 ```
 
+---
+
+## CI/CD with GitHub Actions
+
+### What is CI/CD?
+
+**CI/CD** stands for Continuous Integration and Continuous Delivery/Deployment. It is the practice of automating the steps between writing code and getting it running in production.
+
+- **CI (Continuous Integration)** — automatically build and test code every time it is pushed
+- **CD (Continuous Delivery/Deployment)** — automatically package and deploy that code after a successful build
+
+Without CI/CD:
+
+- Developer builds image manually on their machine
+- Manually logs into DockerHub and pushes
+- Easy to forget steps, push broken images, or use wrong tags
+
+With CI/CD:
+
+- Push a git tag → pipeline automatically builds, tags, and pushes the image
+- Every release is consistent and traceable
+- No manual steps, no human error
+
+---
+
+### What is GitHub Actions?
+
+**GitHub Actions** is GitHub's built-in CI/CD platform. You define workflows as YAML files inside `.github/workflows/`. GitHub runs these workflows on their cloud servers (called **runners**) whenever a trigger event occurs — like a push, pull request, or a new tag.
+
+```
+.github/workflows/docker-build-push.yml  →  runs on GitHub's servers automatically
+```
+
+Key concepts:
+
+| Concept            | What it is                                               |
+| ------------------ | -------------------------------------------------------- |
+| **Workflow**       | The entire automation file (`.yml`)                      |
+| **Trigger (`on`)** | The event that starts the workflow (push, tag, PR)       |
+| **Job**            | A group of steps that run on one runner                  |
+| **Step**           | A single task inside a job (checkout, build, push)       |
+| **Runner**         | The cloud VM that executes the job (`ubuntu-latest`)     |
+| **Secret**         | Encrypted variables stored in GitHub (passwords, tokens) |
+
+---
+
+### Why Tag-Based Triggers?
+
+This pipeline triggers on `v*` tags instead of every push to main. This means:
+
+```
+git tag v1.0.0
+git push origin v1.0.0  →  pipeline runs
+```
+
+- Only intentional releases trigger a build
+- Every DockerHub image is tied to a specific version tag
+- Easy to roll back — just deploy an older tag
+
+---
+
+### Pipeline Workflow
+
+```
+Developer pushes tag (v1.0.0)
+        ↓
+GitHub Actions runner starts (ubuntu-latest)
+        ↓
+Step 1: Checkout code from repo
+        ↓
+Step 2: Login to DockerHub using secrets
+        ↓
+Step 3: docker build → creates image
+        ↓
+Step 4: docker tag → tags as v1.0.0 AND latest
+        ↓
+Step 5: docker push → uploads both tags to DockerHub
+        ↓
+DockerHub: kailashbadu/message-board:v1.0.0
+           kailashbadu/message-board:latest
+```
+
+---
+
+### Workflow File
+
+`.github/workflows/docker-build-push.yml`
+
+```yaml
+name: Deploy-Message-Board
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        run: |
+          TAG=${{ github.ref_name }}
+          docker build -t message-board .
+          docker tag message-board ${{ secrets.DOCKERHUB_USERNAME }}/message-board:$TAG
+          docker tag message-board ${{ secrets.DOCKERHUB_USERNAME }}/message-board:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/message-board:$TAG
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/message-board:latest
+```
+
+---
+
+### Setting Up Secrets
+
+Go to: GitHub repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+
+| Secret               | Value                                 |
+| -------------------- | ------------------------------------- |
+| `DOCKERHUB_USERNAME` | your DockerHub username               |
+| `DOCKERHUB_TOKEN`    | DockerHub access token (not password) |
+
+To generate a DockerHub token: hub.docker.com → Account Settings → Security → **New Access Token**
+
+---
+
+### Triggering the Pipeline
+
+```bash
+git add .
+git commit -m "feat: your changes"
+git push
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Monitor the run at: `https://github.com/kaibad/message-board/actions`
+
+---
+
 ## Kubernetes (K8s)
 
 ### What is Kubernetes?
