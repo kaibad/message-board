@@ -25,4 +25,6 @@ jobs:
           TAG=${{ github.ref_name }}
           docker build -t flask-message-app .
           docker tag flask-message-app ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:$TAG
+          docker tag flask-message-app ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:latest
           docker push ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:$TAG
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:latest
