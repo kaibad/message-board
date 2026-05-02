@@ -1035,44 +1035,134 @@ Instead of managing multiple `kubectl apply -f` commands for each manifest, Helm
 ### Helm Chart Structure
 
 ```
-message-board/
-├── Chart.yaml          # Chart metadata (name, version)
-├── values.yaml         # Default config values
+helm/message-board/
+├── Chart.yaml              # Chart metadata (name, version, description)
+├── values.yaml             # Default config values
 └── templates/
-    ├── flask-deployment.yaml
-    ├── flask-service.yaml
+    ├── configmap.yaml      # Non-sensitive env vars (MYSQL_HOST, MYSQL_DB)
+    ├── secret.yaml         # Sensitive data (passwords)
+    ├── pv.yaml             # PersistentVolume for MySQL
+    ├── pvc.yaml            # PersistentVolumeClaim
     ├── mysql-deployment.yaml
-    └── mysql-service.yaml
+    ├── mysql-service.yaml
+    ├── deployment.yaml     # Flask deployment with probes + resources
+    ├── service.yaml        # Flask NodePort service
+    ├── hpa.yaml            # HPA (conditional on autoscaling.enabled)
+    ├── _helpers.tpl        # Reusable template helpers
+    └── NOTES.txt           # Post-install instructions
 ```
 
-**values.yaml**
+---
+
+### Chart.yaml
 
 ```yaml
-flask:
-  image: kaibad/message-board
-  tag: latest
-  replicas: 2
+apiVersion: v2
+name: message-board
+description: A 2-tier Flask + MySQL message board app
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+```
+
+---
+
+### values.yaml
+
+```yaml
+replicaCount: 2
+
+image:
+  repository: kailashbadu/flask-message-app
+  pullPolicy: Always
+  tag: v1.0.1
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "250m"
+    memory: "256Mi"
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 50
+  targetMemoryUtilizationPercentage: 80
+
+livenessProbe:
+  httpGet:
+    path: /
+    port: 5000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: 5000
+  initialDelaySeconds: 20
+  periodSeconds: 5
+  failureThreshold: 3
+
+service:
+  type: NodePort
+  port: 80
+  targetPort: 5000
+
+ingress:
+  enabled: false
+
+namespace: message-board
 
 mysql:
   image: mysql
   tag: "8.0"
   database: flask_app
   user: flask
+  rootPassword: root12345
+  password: flask123
+  storage: 1Gi
 ```
 
-**Install the chart:**
+---
+
+### Helm Commands
+
+**Scaffold a new chart:**
 
 ```bash
-helm install message-board ./message-board
+helm create message-board
+```
+
+**Validate templates without deploying:**
+
+```bash
+helm template .
+```
+
+**Install:**
+
+```bash
+helm install message-board . --namespace default
+```
+
+**Check release:**
+
+```bash
+helm list
 ```
 
 **Upgrade after changes:**
 
 ```bash
-helm upgrade message-board ./message-board
+helm upgrade message-board .
 ```
 
-**Rollback:**
+**Rollback to previous version:**
 
 ```bash
 helm rollback message-board 1
@@ -1083,6 +1173,93 @@ helm rollback message-board 1
 ```bash
 helm uninstall message-board
 ```
+
+---
+
+### Helm Flow Summary
+
+```
+values.yaml  +  templates/
+        ↓  helm template (renders YAML)
+        ↓  helm install
+Kubernetes receives all manifests in one shot
+        ↓
+Secret → ConfigMap → PV → PVC → MySQL → Flask → HPA
+```
+
+---
+
+### Exec into MySQL pod
+
+```bash
+# Get pod name
+kubectl get pods
+
+# Exec into pod
+kubectl exec -it <mysql-pod-name> -- bash
+
+# Connect to MySQL (use -h 127.0.0.1 to force TCP not socket)
+mysql -u root -proot12345 -h 127.0.0.1
+
+# Inside MySQL
+SHOW DATABASES;
+USE flask_app;
+SHOW TABLES;
+SELECT * FROM messages;
+```
+
+---
+
+## Standalone Ingress (Global)
+
+Ingress is kept outside the Helm chart as a global cluster-level resource — not tied to a specific release. This way it can be managed independently and reused across deployments.
+
+### ingress.yaml
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: message-board-ingress
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: message-board.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flask-service
+                port:
+                  number: 80
+```
+
+### Apply
+
+```bash
+kubectl apply -f k8s/ingress.yml
+kubectl get ingress
+```
+
+### Add host entry
+
+```bash
+# Get minikube IP
+minikube ip
+
+# Add to /etc/hosts
+echo "$(minikube ip) message-board.local" | sudo tee -a /etc/hosts
+
+# Verify
+cat /etc/hosts | grep message-board
+```
+
+Visit `http://message-board.local` in your browser.
 
 ---
 

@@ -1,0 +1,27 @@
+==============================================
+  Message Board — DevOps Project 1
+==============================================
+
+App has been deployed successfully!
+
+1. Get the application URL:
+{{- if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Values.namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services flask-service)
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Values.namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "Visit: http://$NODE_IP:$NODE_PORT"
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Values.namespace }} flask-service --template "{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}")
+  echo "Visit: http://$SERVICE_IP:{{ .Values.service.port }}"
+{{- else if contains "ClusterIP" .Values.service.type }}
+  export POD_NAME=$(kubectl get pods --namespace {{ .Values.namespace }} -l "app=flask" -o jsonpath="{.items[0].metadata.name}")
+  kubectl --namespace {{ .Values.namespace }} port-forward $POD_NAME 5000:{{ .Values.service.targetPort }}
+  echo "Visit: http://127.0.0.1:5000"
+{{- end }}
+
+2. Check running pods:
+  kubectl get pods -n {{ .Values.namespace }}
+
+3. Check all resources:
+  kubectl get all -n {{ .Values.namespace }}
+
+==============================================

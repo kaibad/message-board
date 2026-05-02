@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  namespace: {{ .Values.namespace }}
+data:
+  MYSQL_HOST: mysql-service
+  MYSQL_DB: {{ .Values.mysql.database }}
+  MYSQL_USER: {{ .Values.mysql.user }}
