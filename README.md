@@ -230,7 +230,7 @@ services:
   flask:
     build:
       context: .
-    image: flask-message-app # if image name not given here then  the image name is select as <projectname>_<service name> i.e flask-app_flask
+    image: flask-message-app
     container_name: flask_message_app
     ports:
       - "5000:5000"
@@ -320,7 +320,6 @@ Container (3rd instance)
 ## Nginx
 
 ```nginx
-
 upstream flask_app {
     server flask:5000;
 }
@@ -335,11 +334,9 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
-
-
 ```
 
-### explanation
+### Explanation
 
 ```nginx
 # Defines a group of backend servers
@@ -367,9 +364,9 @@ server {
 }
 ```
 
-### Add in docker compose
+### Add in docker-compose.yml
 
-```yml
+```yaml
 nginx:
   image: nginx:alpine
   container_name: nginx
@@ -384,7 +381,7 @@ nginx:
 
 ### Remove the port exposure from flask service
 
-```yml
+```yaml
 flask:
   build:
     context: .
@@ -574,67 +571,125 @@ Monitor the run at: `https://github.com/kaibad/message-board/actions`
 
 ---
 
-### Kubernetes Manifests for this App
+### Local Cluster Setup (minikube)
 
-**Flask Deployment** (`flask-deployment.yaml`)
+minikube runs a single-node Kubernetes cluster on your local machine — perfect for learning and testing before moving to a cloud provider.
 
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: flask-app
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: flask
-  template:
-    metadata:
-      labels:
-        app: flask
-    spec:
-      containers:
-        - name: flask
-          image: kaibad/message-board:latest
-          ports:
-            - containerPort: 5000
-          env:
-            - name: MYSQL_HOST
-              value: mysql-service
-            - name: MYSQL_USER
-              value: flask
-            - name: MYSQL_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: mysql-secret
-                  key: password
-            - name: MYSQL_DB
-              value: flask_app
+```bash
+# Start the cluster
+minikube start
+
+# Verify node is ready
+kubectl get nodes
+
+# Check cluster info
+kubectl cluster-info
 ```
 
-**Flask Service** (`flask-service.yaml`)
+---
+
+### Namespace
+
+A **namespace** is a virtual cluster inside your cluster. It logically isolates resources — so our app's pods, services, and secrets are separated from system resources in `kube-system`.
+
+```bash
+kubectl create namespace message-board
+kubectl get namespaces
+```
+
+---
+
+### Storage — PV and PVC
+
+#### What is a PersistentVolume (PV)?
+
+A PV is a **piece of storage provisioned in the cluster**. It exists independently of any pod — so even if the MySQL pod crashes or restarts, the data is still there.
+
+#### What is a PersistentVolumeClaim (PVC)?
+
+A PVC is a **request for storage by a pod**. The pod doesn't talk to the PV directly — it claims storage through a PVC.
+
+```
+Pod → PVC → PV → actual disk storage
+```
+
+**pv.yaml**
 
 ```yaml
 apiVersion: v1
-kind: Service
+kind: PersistentVolume
 metadata:
-  name: flask-service
+  name: mysql-pv
 spec:
-  selector:
-    app: flask
-  ports:
-    - port: 80
-      targetPort: 5000
-  type: LoadBalancer
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /data/mysql
 ```
 
-**MySQL Deployment + Service** (`mysql-deployment.yaml`)
+**pvc.yaml**
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+  namespace: message-board
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+```
+
+```bash
+kubectl apply -f k8s/storage/pv.yaml
+kubectl apply -f k8s/storage/pvc.yaml
+kubectl get pv
+kubectl get pvc -n message-board
+```
+
+When PVC shows `Bound` — storage is ready.
+
+---
+
+### Secret
+
+Secrets store sensitive data like passwords. Values are base64 encoded and never hardcoded in deployment files.
+
+**secret.yaml**
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: message-board
+type: Opaque
+stringData:
+  mysql-root-password: root12345
+  mysql-password: flask123
+```
+
+```bash
+kubectl apply -f k8s/app/secret.yaml
+```
+
+---
+
+### MySQL Deployment + Service
+
+**mysql.yaml**
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mysql
+  namespace: message-board
 spec:
   replicas: 1
   selector:
@@ -649,6 +704,11 @@ spec:
         - name: mysql
           image: mysql:8.0
           env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: mysql-root-password
             - name: MYSQL_DATABASE
               value: flask_app
             - name: MYSQL_USER
@@ -657,33 +717,273 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: mysql-secret
-                  key: password
-            - name: MYSQL_ROOT_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: mysql-secret
-                  key: root-password
+                  key: mysql-password
           ports:
             - containerPort: 3306
+          volumeMounts:
+            - name: mysql-storage
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: mysql-storage
+          persistentVolumeClaim:
+            claimName: mysql-pvc
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: mysql-service
+  namespace: message-board
 spec:
   selector:
     app: mysql
   ports:
     - port: 3306
+      targetPort: 3306
 ```
 
-**Apply manifests:**
+---
+
+### Flask Deployment + Service
+
+Flask deployment includes **liveness** and **readiness probes** to let Kubernetes know the health of the app.
+
+#### What is a Liveness Probe?
+
+Checks if the container is **still alive**. If it fails, Kubernetes **restarts** the container.
+
+> "Is the app still running or is it stuck/crashed?"
+
+#### What is a Readiness Probe?
+
+Checks if the container is **ready to receive traffic**. If it fails, Kubernetes **removes it from the load balancer** but does NOT restart it.
+
+> "Is the app ready to serve requests yet?"
+
+```
+Readiness fails → pod removed from Service endpoints (no traffic sent)
+Liveness fails  → pod gets restarted
+```
+
+**flask.yaml**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask
+  namespace: message-board
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: flask
+  template:
+    metadata:
+      labels:
+        app: flask
+    spec:
+      containers:
+        - name: flask
+          image: kailashbadu/message-board:latest
+          ports:
+            - containerPort: 5000
+          env:
+            - name: MYSQL_HOST
+              value: mysql-service
+            - name: MYSQL_USER
+              value: flask
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: mysql-password
+            - name: MYSQL_DB
+              value: flask_app
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 5000
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-service
+  namespace: message-board
+spec:
+  selector:
+    app: flask
+  ports:
+    - port: 80
+      targetPort: 5000
+  type: NodePort
+```
+
+---
+
+### Apply All Manifests
 
 ```bash
-kubectl apply -f flask-deployment.yaml
-kubectl apply -f flask-service.yaml
-kubectl apply -f mysql-deployment.yaml
+kubectl apply -f k8s/app/secret.yaml
+kubectl apply -f k8s/app/mysql.yaml
+kubectl apply -f k8s/app/flask.yaml
+
+# verify everything is running
+kubectl get all -n message-board
 ```
+
+---
+
+### HPA — Horizontal Pod Autoscaler
+
+#### What is HPA?
+
+HPA automatically **scales the number of pods up or down** based on CPU or memory usage.
+
+```
+Low traffic   → 2 pods
+High traffic  → K8s adds more pods automatically (up to max)
+Traffic drops → K8s removes extra pods
+```
+
+> Without HPA you manually change `replicas`. With HPA Kubernetes does it for you based on load.
+
+#### Enable metrics-server on minikube
+
+HPA needs metrics-server to read CPU/memory usage from pods:
+
+```bash
+minikube addons enable metrics-server
+kubectl get pods -n kube-system | grep metrics
+```
+
+#### HPA Manifest
+
+**hpa.yaml**
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: flask-hpa
+  namespace: message-board
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: flask
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+```
+
+This means:
+
+- Keep minimum **2 pods** always running
+- Scale up to **5 pods** max
+- If average CPU across pods exceeds **50%** → add more pods
+
+```bash
+kubectl apply -f k8s/hpa/hpa.yaml
+kubectl get hpa -n message-board
+```
+
+---
+
+### Ingress
+
+#### What is Ingress?
+
+Ingress is a Kubernetes resource that manages **external HTTP/HTTPS access** to services inside the cluster. It acts as a smart reverse proxy — one entry point that routes traffic to different services based on path or hostname.
+
+```
+Without Ingress:
+  user → flask-service:31832 (NodePort — ugly port number)
+
+With Ingress:
+  user → ingress (port 80) → /  → flask-service
+                            → /api → another-service
+```
+
+|              | NodePort/LoadBalancer | Ingress                     |
+| ------------ | --------------------- | --------------------------- |
+| Entry points | One per service       | One for all services        |
+| URL routing  | Not supported         | Path and host based routing |
+| SSL/TLS      | Manual per service    | Centralized at ingress      |
+| Cost on AWS  | One ELB per service   | One ELB for everything      |
+
+#### Enable Ingress on minikube
+
+```bash
+minikube addons enable ingress
+kubectl get pods -n ingress-nginx
+```
+
+#### Ingress Manifest
+
+**ingress.yaml**
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: message-board-ingress
+  namespace: message-board
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: message-board.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flask-service
+                port:
+                  number: 80
+```
+
+```bash
+kubectl apply -f k8s/ingress/ingress.yaml
+kubectl get ingress -n message-board
+```
+
+#### Add host entry
+
+```bash
+# Add minikube IP to /etc/hosts
+echo "$(minikube ip) message-board.local" | sudo tee -a /etc/hosts
+
+# Verify
+cat /etc/hosts | grep message-board
+```
+
+Visit `http://message-board.local` in your browser.
 
 ---
 
@@ -692,11 +992,19 @@ kubectl apply -f mysql-deployment.yaml
 ```
 Docker Image (DockerHub)
         ↓
-   K8s Deployment  →  creates Pods  →  containers run inside pods
+   Namespace created (message-board)
         ↓
-   K8s Service     →  exposes pods to traffic
+   PV + PVC provisioned (MySQL storage)
         ↓
-   LoadBalancer    →  external IP for users
+   Secret created (DB credentials)
+        ↓
+   MySQL Deployment → Pod → data stored on PVC
+        ↓
+   Flask Deployment → 2 Pods → liveness + readiness probes active
+        ↓
+   HPA watches CPU → scales Flask pods 2-5 automatically
+        ↓
+   Ingress → routes http://message-board.local → flask-service → pods
 ```
 
 ---
@@ -879,16 +1187,27 @@ message-board/
 ├── .env                    # Environment variables (not committed)
 ├── .gitignore
 ├── README.md
+├── nginx/
+│   └── nginx.conf          # Nginx reverse proxy config
 ├── templates/
 │   └── index.html          # Frontend UI
+├── k8s/
+│   ├── storage/
+│   │   ├── pv.yaml
+│   │   └── pvc.yaml
+│   ├── app/
+│   │   ├── secret.yaml
+│   │   ├── mysql.yaml
+│   │   └── flask.yaml
+│   ├── hpa/
+│   │   └── hpa.yaml
+│   └── ingress/
+│       └── ingress.yaml
 └── helm/
     └── message-board/
         ├── Chart.yaml
         ├── values.yaml
         └── templates/
-            ├── flask-deployment.yaml
-            ├── flask-service.yaml
-            └── mysql-deployment.yaml
 ```
 
 ---
@@ -899,9 +1218,16 @@ message-board/
 | ---------------- | -------------- |
 | Backend          | Flask (Python) |
 | Database         | MySQL          |
+| Reverse Proxy    | Nginx          |
 | Containerization | Docker         |
 | Orchestration    | Kubernetes     |
+| Autoscaling      | HPA            |
+| Ingress          | Nginx Ingress  |
 | Helm Charts      | Helm           |
 | Cloud            | AWS EKS        |
 
 ---
+
+## Author
+
+**Kailash** — [@kaibad](https://github.com/kaibad)
