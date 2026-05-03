@@ -3,7 +3,7 @@ replicaCount: 2
 image:
   repository: kailashbadu/flask-message-app
   pullPolicy: Always
-  tag: v1.0.1
+  tag: v1.0.5
 
 resources:
   requests:
@@ -48,7 +48,7 @@ namespace: default
 
 mysql:
   image: mysql
-  tag: "8.0"
+  tag: v1.0.5
   database: flask_app
   user: flask
   rootPassword: root12345
