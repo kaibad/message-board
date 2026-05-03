@@ -20,6 +20,8 @@ GitHub → GitHub Actions → DockerHub → ArgoCD → Kubernetes (Helm) → AWS
 - **GitOps/CD:** ArgoCD
 - **Cloud:** AWS EKS
 
+![Architecture of project](./images/initial-architecture.png)
+
 ---
 
 ## Getting Started
