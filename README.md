@@ -7,14 +7,17 @@ A 2-tier web application built with **Flask** and **MySQL**, containerized with 
 ## Architecture
 
 ```
-GitHub → Docker → DockerHub → Kubernetes (Helm) → AWS EKS
+GitHub → GitHub Actions → DockerHub → ArgoCD → Kubernetes (Helm) → AWS EKS
 ```
 
 - **Frontend + Backend:** Flask (Python)
 - **Database:** MySQL
 - **Containerization:** Docker
+- **CI Pipeline:** GitHub Actions
+- **Container Registry:** DockerHub
 - **Orchestration:** Kubernetes
 - **Package Manager:** Helm
+- **GitOps/CD:** ArgoCD
 - **Cloud:** AWS EKS
 
 ---
@@ -1574,22 +1577,368 @@ Common causes of ALB not being created:
 - Subnets in Ingress annotation are private (need public for internet-facing)
 - Subnets missing tag `kubernetes.io/role/elb: 1`
 
+---
+
+## GitOps with ArgoCD
+
+### What is GitOps?
+
+**GitOps** is a practice where your **Git repository is the single source of truth** for what should be running in your cluster. Instead of manually running `helm install` or `kubectl apply`, you push to Git and the cluster automatically updates itself.
+
+```
+Without GitOps:
+  Developer → kubectl apply / helm install → Cluster
+  (manual, error-prone, no audit trail)
+
+With GitOps:
+  Developer → git push → ArgoCD watches → Cluster auto-updates
+  (automated, auditable, self-healing)
+```
+
+**Core GitOps principles:**
+
+- Desired state lives in Git
+- Changes happen through Pull Requests — full audit trail
+- If someone manually changes the cluster, ArgoCD reverts it back to what Git says (self-healing)
+- Rollback = `git revert`
+
+---
+
+### What is ArgoCD?
+
+**ArgoCD** is a GitOps continuous delivery tool for Kubernetes. It runs inside your cluster and continuously watches your Git repo. When it detects a change (new image tag, updated values, new manifest), it automatically syncs the cluster to match.
+
+```
+Git repo (desired state)
+        ↓  ArgoCD watches every ~3 minutes
+Kubernetes cluster (actual state)
+        ↓
+If diff detected → ArgoCD syncs automatically
+```
+
+Key features:
+
+- **Automated sync** — detects and applies changes automatically
+- **Self-healing** — reverts manual kubectl changes that don't match Git
+- **Prune** — removes resources that are deleted from Git
+- **Visual UI** — shows full resource tree, sync status, pod health
+
+---
+
+### Full CI/CD + GitOps Flow
+
+```
+Developer pushes git tag (v1.0.3)
+        ↓
+GitHub Actions triggered
+        ↓
+Step 1: docker build → image built
+        ↓
+Step 2: docker push → kailashbadu/flask-message-app:v1.0.3 on DockerHub
+        ↓
+Step 3: sed updates tag in k8s/helm/message-board/values.yaml
+        ↓
+Step 4: git push → values.yaml committed to main branch
+        ↓
+ArgoCD detects values.yaml changed (polls every 3 min)
+        ↓
+ArgoCD runs helm upgrade on EKS cluster
+        ↓
+New pods with v1.0.3 image roll out (rolling update)
+        ↓
+🌍 Live at ALB DNS — zero manual steps
+```
+
+---
+
+### Install ArgoCD on EKS
+
+```bash
+# Create namespace
+kubectl create namespace argocd
+
+# Install ArgoCD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Watch pods come up
+kubectl get pods -n argocd -w
+```
+
+---
+
+### Install ArgoCD CLI
+
+```bash
+curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+chmod +x argocd
+sudo mv argocd /usr/local/bin/
+argocd version
+```
+
+---
+
+### Expose ArgoCD UI
+
+By default ArgoCD server is `ClusterIP`. Change to `LoadBalancer` so it's accessible from browser:
+
+```bash
+kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+kubectl get svc argocd-server -n argocd
+```
+
+Wait until `EXTERNAL-IP` is populated — it will be an AWS ALB DNS name.
+
+Get the admin password:
+
+```bash
+kubectl get secret argocd-initial-admin-secret -n argocd \
+  -o jsonpath="{.data.password}" | base64 -d
+echo
+```
+
+Login at: `https://<EXTERNAL-IP>`
+
+- **Username:** `admin`
+- **Password:** output from above
+
+> Browser will show a security warning — click **Advanced → Proceed** (self-signed cert).
+
+---
+
+### Login via CLI
+
+```bash
+argocd login <EXTERNAL-IP> \
+  --username admin \
+  --password <your-password> \
+  --insecure
+```
+
+---
+
+### Connect GitHub Repo
+
+Since the repo is private, add credentials:
+
+```bash
+argocd repo add https://github.com/kaibad/message-board \
+  --username kaibad \
+  --password <github-personal-access-token> \
+  --insecure
+```
+
+> Generate GitHub token: github.com → Settings → Developer settings → Personal access tokens → Generate new token → select `repo` scope
+
+---
+
+### Create ArgoCD Application
+
+**argocd-app.yaml**
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: message-board
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/kaibad/message-board
+    targetRevision: main
+    path: k8s/helm/message-board
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+| Field                | Value                            | Meaning                               |
+| -------------------- | -------------------------------- | ------------------------------------- |
+| `repoURL`            | GitHub repo URL                  | Where ArgoCD watches for changes      |
+| `targetRevision`     | `main`                           | Which branch to watch                 |
+| `path`               | `k8s/helm/message-board`         | Path to Helm chart inside repo        |
+| `destination.server` | `https://kubernetes.default.svc` | Deploy to same cluster ArgoCD runs in |
+| `automated.prune`    | `true`                           | Delete resources removed from Git     |
+| `automated.selfHeal` | `true`                           | Revert manual kubectl changes         |
+
+```bash
+kubectl apply -f argocd-app.yaml
+kubectl get application -n argocd
+```
+
+Expected output:
+
+```
+NAME            SYNC STATUS   HEALTH STATUS
+message-board   Synced        Healthy
+```
+
+---
+
+### Updated GitHub Actions Workflow
+
+The CI pipeline now has an extra step — after pushing the image, it updates the image tag in `values.yaml` and commits back to `main`. ArgoCD then detects this change and deploys.
+
+`.github/workflows/docker-build-push.yml`
+
+```yaml
+name: Deploy Application
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        run: |
+          TAG=${{ github.ref_name }}
+          docker build -t flask-message-app .
+          docker tag flask-message-app ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:$TAG
+          docker tag flask-message-app ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:latest
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:$TAG
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/flask-message-app:latest
+
+      - name: Update image tag in Helm values
+        run: |
+          TAG=${{ github.ref_name }}
+          sed -i "s/tag: .*/tag: $TAG/" k8s/helm/message-board/values.yaml
+          cat k8s/helm/message-board/values.yaml
+
+      - name: Commit and push updated values.yaml
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add k8s/helm/message-board/values.yaml
+          git commit -m "ci: update image tag to ${{ github.ref_name }}"
+          git push origin HEAD:main
+```
+
+**Why `permissions: contents: write`?**
+By default GitHub Actions runner has read-only access to the repo. This permission grants write access so it can commit and push the updated `values.yaml` back to `main`.
+
+**Why `ref: main` in checkout?**
+When triggered by a tag push, the runner checks out the tag (detached HEAD state) by default. Specifying `ref: main` checks out the main branch instead — so the git push back to `main` works correctly.
+
+---
+
+### Triggering a Full GitOps Deployment
+
+```bash
+# Make a code change
+vim app.py  # or any file
+
+# Commit and push
+git add .
+git commit -m "feat: your changes"
+git push
+
+# Tag the release — this triggers the pipeline
+git tag v1.0.3
+git push origin v1.0.3
+```
+
+Then watch:
+
+1. **GitHub Actions** tab — image build + values.yaml update
+2. **ArgoCD UI** — detects change, syncs, rolls out new pods
+3. **kubectl** — new pods with updated image
+
+```bash
+kubectl get pods -w
+kubectl describe pod <flask-pod> | grep Image
+```
+
+---
+
+### ArgoCD Commands
+
+```bash
+# Check app status
+argocd app get message-board
+
+# Manual sync (if needed)
+argocd app sync message-board
+
+# Check sync history
+argocd app history message-board
+
+# Rollback to previous version
+argocd app rollback message-board 1
+
+# List all apps
+argocd app list
+
+# Delete app
+argocd app delete message-board
+```
+
+---
+
+### ArgoCD Flow Summary
+
+```
+Git tag pushed
+        ↓
+GitHub Actions: build → push image → update values.yaml → git push
+        ↓
+ArgoCD detects values.yaml diff (polls every 3 min)
+        ↓
+ArgoCD: helm upgrade → rolling update on EKS
+        ↓
+Old pods terminate → new pods start with new image
+        ↓
+Readiness probe passes → pod added to load balancer
+        ↓
+ALB routes traffic to new pods
+        ↓
+Zero downtime deployment complete ✅
+```
+
 ## Project Structure
 
 ```
 message-board/
-├── app.py                  # Flask application
-├── requirements.txt        # Python dependencies
-├── message.sql             # Database schema
-├── Dockerfile              # Docker image instructions
-├── docker-compose.yml      # Multi-container local setup
-├── .env                    # Environment variables (not committed)
+├── app.py                          # Flask application
+├── requirements.txt                # Python dependencies
+├── message.sql                     # Database schema
+├── Dockerfile                      # Docker image instructions
+├── docker-compose.yml              # Multi-container local setup
+├── .env                            # Environment variables (not committed)
 ├── .gitignore
 ├── README.md
 ├── nginx/
-│   └── nginx.conf          # Nginx reverse proxy config
+│   └── nginx.conf                  # Nginx reverse proxy config
 ├── templates/
-│   └── index.html          # Frontend UI
+│   └── index.html                  # Frontend UI
+├── .github/
+│   └── workflows/
+│       └── docker-build-push.yml   # GitHub Actions CI/CD pipeline
 ├── k8s/
 │   ├── storage/
 │   │   ├── pv.yaml
@@ -1600,13 +1949,26 @@ message-board/
 │   │   └── flask.yaml
 │   ├── hpa/
 │   │   └── hpa.yaml
-│   └── ingress/
-│       └── ingress.yaml
-└── helm/
+│   ├── ingress/
+│   │   └── ingress.yaml
+│   └── argocd/
+│       └── argocd-app.yaml         # ArgoCD Application manifest
+└── k8s/helm/
     └── message-board/
         ├── Chart.yaml
-        ├── values.yaml
+        ├── values.yaml             # Image tag updated by CI pipeline
         └── templates/
+            ├── configmap.yaml
+            ├── secret.yaml
+            ├── pv.yaml
+            ├── pvc.yaml
+            ├── mysql-deployment.yaml
+            ├── mysql-service.yaml
+            ├── deployment.yaml
+            ├── service.yaml
+            ├── hpa.yaml
+            ├── _helpers.tpl
+            └── NOTES.txt
 ```
 
 ---
@@ -1867,17 +2229,20 @@ Visit `http://message-board.local` in your browser.
 
 ## Tech Stack
 
-| Layer            | Technology     |
-| ---------------- | -------------- |
-| Backend          | Flask (Python) |
-| Database         | MySQL          |
-| Reverse Proxy    | Nginx          |
-| Containerization | Docker         |
-| Orchestration    | Kubernetes     |
-| Autoscaling      | HPA            |
-| Ingress          | Nginx Ingress  |
-| Helm Charts      | Helm           |
-| Cloud            | AWS EKS        |
+| Layer            | Technology                         |
+| ---------------- | ---------------------------------- |
+| Backend          | Flask (Python)                     |
+| Database         | MySQL                              |
+| Reverse Proxy    | Nginx                              |
+| Containerization | Docker                             |
+| Orchestration    | Kubernetes                         |
+| Autoscaling      | HPA                                |
+| Ingress (local)  | Nginx Ingress                      |
+| Ingress (AWS)    | AWS ALB (Load Balancer Controller) |
+| Package Manager  | Helm                               |
+| CI Pipeline      | GitHub Actions                     |
+| CD / GitOps      | ArgoCD                             |
+| Cloud            | AWS EKS                            |
 
 ---
 
