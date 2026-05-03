@@ -1035,6 +1035,608 @@ Instead of managing multiple `kubectl apply -f` commands for each manifest, Helm
 ### Helm Chart Structure
 
 ```
+message-board/
+├── Chart.yaml          # Chart metadata (name, version)
+├── values.yaml         # Default config values
+└── templates/
+    ├── flask-deployment.yaml
+    ├── flask-service.yaml
+    ├── mysql-deployment.yaml
+    └── mysql-service.yaml
+```
+
+**values.yaml**
+
+```yaml
+flask:
+  image: kaibad/message-board
+  tag: latest
+  replicas: 2
+
+mysql:
+  image: mysql
+  tag: "8.0"
+  database: flask_app
+  user: flask
+```
+
+**Install the chart:**
+
+```bash
+helm install message-board ./message-board
+```
+
+**Upgrade after changes:**
+
+```bash
+helm upgrade message-board ./message-board
+```
+
+**Rollback:**
+
+```bash
+helm rollback message-board 1
+```
+
+**Uninstall:**
+
+```bash
+helm uninstall message-board
+```
+
+---
+
+---
+
+## AWS EKS Deployment
+
+### What is EKS?
+
+**Amazon Elastic Kubernetes Service (EKS)** is AWS's managed Kubernetes service. Instead of setting up and managing your own Kubernetes control plane, AWS handles it for you. You just create a cluster and add worker nodes.
+
+---
+
+### Minikube vs EKS
+
+| Aspect            | Minikube                      | EKS (AWS)                                  |
+| ----------------- | ----------------------------- | ------------------------------------------ |
+| Control Plane     | Your laptop/VM                | AWS managed, multi-AZ                      |
+| Worker Nodes      | Same machine as control plane | Separate EC2 instances                     |
+| Networking        | Local virtual network         | Real AWS VPC, subnets, security groups     |
+| Load Balancer     | Not real (minikube tunnel)    | Real AWS ALB/NLB provisioned automatically |
+| High Availability | None                          | Built-in across AZs                        |
+| Access            | Local only                    | Accessible globally via IAM                |
+| Use case          | Local dev/learning            | Staging, production                        |
+| Cost              | Free (uses your CPU/RAM)      | Pay for EC2 nodes + $0.10/hr control plane |
+
+---
+
+### Phase 1 — Create IAM Roles
+
+Before creating the cluster, two IAM roles are needed.
+
+#### Role 1 — EKS Cluster Role
+
+1. Go to **IAM → Roles → Create role**
+2. Select **AWS Service** → Use case: **EKS** → Select **EKS - Cluster**
+3. Click **Next → Next**
+4. Role name: `eks-cluster-role`
+5. Click **Create role**
+
+#### Role 2 — Node Group Role
+
+1. Go to **IAM → Roles → Create role**
+2. Select **AWS Service** → Use case: **EC2** → **Next**
+3. Attach these 3 policies:
+   - `AmazonEKSWorkerNodePolicy` — allows node to register with EKS cluster
+   - `AmazonEC2ContainerRegistryReadOnly` — allows node to pull images from ECR
+   - `AmazonEKS_CNI_Policy` — allows VPC CNI plugin to manage network interfaces
+4. Role name: `eks-nodegroup-role`
+5. Click **Create role**
+
+---
+
+### Phase 2 — Create EKS Cluster
+
+1. Search **EKS** in AWS Console → **Elastic Kubernetes Service**
+2. Click **Create cluster**
+3. **Configure cluster tab:**
+   - Name: `message-board-cluster`
+   - Kubernetes version: latest stable
+   - Cluster IAM Role: `eks-cluster-role`
+   - Click **Next**
+4. **Networking tab:**
+   - Select your **VPC** (default VPC is fine)
+   - Select **at least 3 subnets** across different AZs (`us-east-1a`, `us-east-1b`, `us-east-1c`)
+   - Select your **Security Group**
+   - Cluster endpoint access: **Public and Private**
+   - Click **Next**
+5. **Observability tab:** Leave default → **Next**
+6. **Add-ons tab:** Leave defaults → **Next**
+7. **Configure add-on settings:** Select latest versions for all → **Next**
+8. **Review → Create**
+
+> ⏳ Cluster creation takes 10–15 minutes.
+
+#### Why Minimum 3 Subnets?
+
+1. **High Availability** — each subnet in a different AZ. If one AZ goes down, pods in other AZs keep running
+2. **Load Balancer requirement** — AWS ALB/NLB require subnets in at least 2 AZs
+3. **EKS Control Plane HA** — AWS runs control plane components across multiple AZs
+4. **Pod scheduling spread** — Kubernetes can spread pod replicas across AZs
+5. **AWS Best Practice** — a region has 3 AZs, use all 3
+
+---
+
+### Phase 3 — EC2 Management Instance
+
+The EC2 management instance is a **client machine** — it runs `kubectl` and `helm` to send API requests to the EKS control plane. It is NOT a master node. AWS manages the actual control plane.
+
+> If the management EC2 goes down, deployed pods keep running. You just lose the ability to run `kubectl` commands until restored.
+
+#### Launch EC2
+
+- AMI: **Ubuntu 22.04 LTS**
+- Instance type: **t2.micro** (free tier)
+- Security Group: allow SSH (port 22) from your IP
+
+#### SSH into EC2
+
+```bash
+ssh -i your-key.pem ubuntu@<EC2_PUBLIC_IP>
+```
+
+#### Install Tools
+
+```bash
+# AWS CLI
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+sudo apt install unzip -y
+unzip awscliv2.zip
+sudo ./aws/install
+aws configure
+# Enter: Access Key, Secret Key, region: us-east-1, output: json
+
+# kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+kubectl version --client
+
+# eksctl
+curl --silent --location \
+  "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" \
+  | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin/
+eksctl version
+
+# Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+# Git
+sudo apt update && sudo apt install git -y
+```
+
+---
+
+### Phase 4 — Create Node Group
+
+Worker nodes run your actual application pods.
+
+1. Go to **EKS → message-board-cluster → Compute tab**
+2. Click **Add Node Group**
+3. **Configure:**
+   - Name: `message-board-workers`
+   - Node IAM Role: `eks-nodegroup-role`
+   - Click **Next**
+4. **Compute configuration:**
+   - AMI type: `Amazon Linux 2 (AL2_x86_64)`
+   - Instance type: `t3.medium`
+   - Disk size: `20 GiB`
+5. **Scaling configuration:**
+   - Desired: `2`, Minimum: `1`, Maximum: `3`
+6. Select your **3 subnets** → **Next** → **Create**
+
+> ⏳ Takes 3–5 minutes.
+
+#### Why Docker is Not Needed on Worker Nodes
+
+EKS worker nodes use **containerd** directly (not Docker) since Kubernetes 1.24. When a pod is scheduled, the kubelet instructs containerd to pull the image and start the container — no Docker daemon involved. Public DockerHub images pull without authentication. For private ECR images, the node IAM role's `AmazonEC2ContainerRegistryReadOnly` policy handles auth automatically.
+
+---
+
+### Phase 5 — Connect kubectl to Cluster
+
+```bash
+aws eks update-kubeconfig --name=message-board-cluster --region=us-east-1
+```
+
+This command:
+
+1. Calls the EKS API to get the cluster endpoint and certificate
+2. Writes connection details to `~/.kube/config`
+3. Sets the current context so all `kubectl` commands target this cluster
+
+Verify:
+
+```bash
+kubectl get nodes
+# NAME                            STATUS   ROLES    AGE
+# ip-172-31-41-226.ec2.internal   Ready    <none>   7m
+# ip-172-31-7-214.ec2.internal    Ready    <none>   7m
+```
+
+#### Troubleshooting — Unauthorized Error
+
+If you get an `Unauthorized` error:
+
+1. Go to **EKS → message-board-cluster → Access tab**
+2. Click **Create access entry**
+3. Get your IAM ARN:
+   ```bash
+   aws sts get-caller-identity --query Arn --output text
+   ```
+4. Add policies: `AmazonEKSAdminPolicy` + `AmazonEKSClusterPolicy`
+
+#### Troubleshooting — i/o timeout
+
+The EKS cluster security group only allows traffic from itself by default. Add an inbound rule:
+
+1. Go to **EKS → message-board-cluster → Networking tab**
+2. Click the **Cluster security group** (e.g., `sg-04cf0741e3ad55f34`)
+3. **Edit inbound rules → Add rule:**
+   - Type: **HTTPS**, Port: **443**, Source: **0.0.0.0/0**
+4. Save
+
+---
+
+### Phase 6 — Deploy with Helm
+
+Clone the repo on EC2 and deploy:
+
+```bash
+mkdir ~/kubernetes && cd ~/kubernetes
+git clone https://github.com/kaibad/message-board.git
+cd message-board
+
+helm install message-board ~/kubernetes/message-board
+kubectl get all
+```
+
+Expected output:
+
+```
+pod/message-board-flask-xxx   1/1   Running   2/2
+pod/mysql-xxx                 1/1   Running   1/1
+service/flask-service         NodePort
+service/mysql-service         ClusterIP
+deployment/message-board-flask  2/2
+horizontalpodautoscaler       cpu: 2%/50%, memory: 34%/80%
+```
+
+---
+
+### Phase 7 — ALB Ingress Controller
+
+#### What is the AWS Load Balancer Controller?
+
+The **AWS Load Balancer Controller** is a Kubernetes controller that watches for `Ingress` resources and automatically creates and configures AWS **Application Load Balancers (ALB)**. It replaces the nginx ingress controller used in minikube.
+
+```
+Without Ingress:
+  Browser → NLB-1 → flask-service
+  (one load balancer per service, expensive)
+
+With ALB Ingress:
+  Browser → ALB (1 load balancer)
+             └── / → flask-service
+  (one load balancer, one bill, one DNS name)
+```
+
+---
+
+#### Step 1 — Add OIDC Provider to IAM
+
+**What is OIDC?**
+OpenID Connect (OIDC) is the mechanism that allows **Kubernetes Service Accounts to assume AWS IAM roles**. EKS acts as an identity provider — it issues tokens that AWS IAM trusts, so pods can call AWS APIs without hardcoded credentials. This is called **IRSA (IAM Roles for Service Accounts)**.
+
+1. Go to **EKS → message-board-cluster → Overview tab**
+2. Copy the **OpenID Connect provider URL**
+3. Go to **IAM → Identity providers → Add provider**
+   - Provider type: **OpenID Connect**
+   - Provider URL: paste the OIDC URL
+   - Audience: `sts.amazonaws.com`
+4. Click **Add provider**
+
+Get your OIDC ID:
+
+```bash
+aws eks describe-cluster --name message-board-cluster --region us-east-1 \
+  --query "cluster.identity.oidc.issuer" --output text
+# https://oidc.eks.us-east-1.amazonaws.com/id/ABC123...
+# The part after /id/ is your OIDC ID
+```
+
+**What is AWS STS?**
+AWS Security Token Service issues **temporary, short-lived credentials**. When a pod needs to call the AWS API, it presents its OIDC token to STS, which validates it and returns temporary credentials valid for ~1 hour. Far more secure than long-lived Access Keys stored in Secrets.
+
+---
+
+#### Step 2 — Create ALB Controller IAM Policy
+
+```bash
+curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.14.1/docs/install/iam_policy.json
+```
+
+1. Go to **IAM → Policies → Create policy**
+2. Select **JSON** tab → paste contents of `iam_policy.json`
+3. Policy name: `elb-policy`
+4. Click **Create policy**
+
+---
+
+#### Step 3 — Create ALB IAM Role
+
+1. **IAM → Roles → Create role → AWS Service → EC2 → Next**
+2. Attach `elb-policy` → **Next**
+3. Role name: `eks-alb-role` → **Create role**
+
+Edit the trust relationship — click the role → **Trust relationships → Edit trust policy**:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::290657649733:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/<YourOIDCId>"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "oidc.eks.us-east-1.amazonaws.com/id/<YourOIDCId>:aud": "sts.amazonaws.com",
+          "oidc.eks.us-east-1.amazonaws.com/id/<YourOIDCId>:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller"
+        }
+      }
+    }
+  ]
+}
+```
+
+| Field | Meaning                               | Example                                                          |
+| ----- | ------------------------------------- | ---------------------------------------------------------------- |
+| `aud` | Target service (who the token is for) | `sts.amazonaws.com`                                              |
+| `sub` | Identity (which ServiceAccount)       | `system:serviceaccount:kube-system:aws-load-balancer-controller` |
+
+Both must match — AWS verifies the correct receiver (`aud`) AND correct sender (`sub`).
+
+---
+
+#### Step 4 — Create Kubernetes Service Account
+
+**What is a Service Account?**
+A Service Account is an identity for **processes running inside pods**. By default pods use the `default` SA which has no AWS permissions. When annotated with an IAM role ARN, EKS injects an OIDC token into the pod and sets `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE` env vars automatically — this is IRSA.
+
+The ALB controller goes in `kube-system` because it is a cluster infrastructure component, separated from user workloads for security and operational clarity.
+
+```bash
+cat > sa.yaml << 'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aws-load-balancer-controller
+  namespace: kube-system
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::290657649733:role/eks-alb-role
+EOF
+
+kubectl apply -f sa.yaml
+kubectl describe sa aws-load-balancer-controller -n kube-system
+```
+
+---
+
+#### Step 5 — Install ALB Controller via Helm
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update eks
+
+# Get your VPC ID
+aws ec2 describe-vpcs --region us-east-1 \
+  --query "Vpcs[?IsDefault==\`true\`].VpcId" --output text
+
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=message-board-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=us-east-1 \
+  --set vpcId=<YOUR_VPC_ID> \
+  --version 1.14.0
+
+# Verify
+kubectl get deployment -n kube-system aws-load-balancer-controller
+kubectl get pods -n kube-system | grep aws-load-balancer
+```
+
+---
+
+#### Step 6 — Apply Ingress
+
+```bash
+cat > ingress.yaml << 'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: message-board-ingress
+  namespace: default
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/subnets: <SubnetId-1>, <SubnetId-2>, <SubnetId-3>
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-port: "5000"
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: flask-service
+                port:
+                  number: 80
+EOF
+
+kubectl apply -f ingress.yaml
+kubectl get ingress
+```
+
+Wait 2–3 minutes for ALB to provision. The `ADDRESS` column will populate with the ALB DNS name.
+
+#### Ingress Annotation Explained
+
+| Annotation                                   | Value             | Purpose                                          |
+| -------------------------------------------- | ----------------- | ------------------------------------------------ |
+| `alb.ingress.kubernetes.io/scheme`           | `internet-facing` | ALB is public. Use `internal` for VPC-only       |
+| `alb.ingress.kubernetes.io/target-type`      | `ip`              | Routes directly to pod IPs (recommended for EKS) |
+| `alb.ingress.kubernetes.io/subnets`          | Subnet IDs        | Public subnets where ALB is placed               |
+| `alb.ingress.kubernetes.io/healthcheck-path` | `/`               | ALB health check path                            |
+| `alb.ingress.kubernetes.io/healthcheck-port` | `5000`            | Health check port on the pod                     |
+
+#### How the ALB is Created Automatically
+
+When you `kubectl apply -f ingress.yaml`, the AWS Load Balancer Controller:
+
+1. Detects the new Ingress object
+2. Calls AWS API to create an ALB in the specified subnets
+3. Creates target groups pointing to pod IPs
+4. Creates listeners on port 80
+5. Configures routing rules based on path
+6. Writes the ALB DNS name back to `ingress.status`
+
+---
+
+### Full EKS Flow Summary
+
+```
+IAM Roles created (cluster + nodegroup)
+        ↓
+EKS Cluster created (AWS Console) — 3 subnets, public+private endpoint
+        ↓
+EC2 Management Instance — kubectl, helm, aws cli, eksctl installed
+        ↓
+Node Group created — 2x t3.medium EC2 worker nodes
+        ↓
+kubectl connected via aws eks update-kubeconfig
+        ↓
+Helm chart deployed — Flask + MySQL + HPA running
+        ↓
+OIDC provider added to IAM
+        ↓
+ALB Controller IAM Role + Service Account created (IRSA)
+        ↓
+AWS Load Balancer Controller installed via Helm
+        ↓
+Ingress applied → ALB provisioned automatically
+        ↓
+🌍 App live at ALB DNS: k8s-default-messageb-xxx.us-east-1.elb.amazonaws.com
+```
+
+---
+
+### Troubleshooting
+
+```bash
+# ALB not being created — check controller logs
+kubectl logs -n kube-system deployment/aws-load-balancer-controller
+
+# Check ingress events
+kubectl describe ingress message-board-ingress
+
+# Restart controller after changes
+kubectl rollout restart deployment aws-load-balancer-controller -n kube-system
+
+# Check pods
+kubectl get pods -n kube-system | grep aws-load-balancer
+```
+
+Common causes of ALB not being created:
+
+- IAM role ARN in Service Account annotation is wrong
+- OIDC trust policy has wrong account ID or OIDC ID
+- Subnets in Ingress annotation are private (need public for internet-facing)
+- Subnets missing tag `kubernetes.io/role/elb: 1`
+
+## Project Structure
+
+```
+message-board/
+├── app.py                  # Flask application
+├── requirements.txt        # Python dependencies
+├── message.sql             # Database schema
+├── Dockerfile              # Docker image instructions
+├── docker-compose.yml      # Multi-container local setup
+├── .env                    # Environment variables (not committed)
+├── .gitignore
+├── README.md
+├── nginx/
+│   └── nginx.conf          # Nginx reverse proxy config
+├── templates/
+│   └── index.html          # Frontend UI
+├── k8s/
+│   ├── storage/
+│   │   ├── pv.yaml
+│   │   └── pvc.yaml
+│   ├── app/
+│   │   ├── secret.yaml
+│   │   ├── mysql.yaml
+│   │   └── flask.yaml
+│   ├── hpa/
+│   │   └── hpa.yaml
+│   └── ingress/
+│       └── ingress.yaml
+└── helm/
+    └── message-board/
+        ├── Chart.yaml
+        ├── values.yaml
+        └── templates/
+```
+
+---
+
+## Helm
+
+### What is Helm?
+
+**Helm** is the **package manager for Kubernetes**. Just like `apt` installs packages on Ubuntu or `pip` installs Python packages, Helm installs applications on Kubernetes.
+
+Instead of managing multiple `kubectl apply -f` commands for each manifest, Helm bundles everything into a **Chart** — a package of all the Kubernetes manifests for an application.
+
+> Helm = Kubernetes manifests + templating + versioning + one-command install
+
+---
+
+### Why Helm over plain kubectl?
+
+| Plain kubectl                            | Helm                                    |
+| ---------------------------------------- | --------------------------------------- |
+| Apply each file manually                 | `helm install` does everything          |
+| Hard to manage different envs (dev/prod) | Use `values.yaml` per environment       |
+| No versioning or rollback                | `helm rollback` to any previous version |
+| Duplicate YAML for similar apps          | Reusable templates                      |
+
+---
+
+### Helm Chart Structure
+
+```
 helm/message-board/
 ├── Chart.yaml              # Chart metadata (name, version, description)
 ├── values.yaml             # Default config values
@@ -1260,132 +1862,6 @@ cat /etc/hosts | grep message-board
 ```
 
 Visit `http://message-board.local` in your browser.
-
----
-
-## AWS EKS Deployment
-
-### What is EKS?
-
-**Amazon Elastic Kubernetes Service (EKS)** is AWS's managed Kubernetes service. Instead of setting up and managing your own Kubernetes control plane, AWS handles it for you. You just create a cluster and add worker nodes.
-
----
-
-### EKS Setup Steps
-
-**Step 1 — Install tools**
-
-```bash
-# AWS CLI
-sudo apt install awscli -y
-aws configure
-
-# eksctl
-curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
-sudo mv /tmp/eksctl /usr/local/bin
-
-# kubectl
-sudo snap install kubectl --classic
-
-# helm
-sudo snap install helm --classic
-```
-
-**Step 2 — Create EKS cluster**
-
-```bash
-eksctl create cluster \
-  --name message-board \
-  --region ap-south-1 \
-  --nodegroup-name standard-workers \
-  --node-type t3.medium \
-  --nodes 2
-```
-
-**Step 3 — Connect kubectl to EKS**
-
-```bash
-aws eks update-kubeconfig --region ap-south-1 --name message-board
-kubectl get nodes  # verify connection
-```
-
-**Step 4 — Push image to DockerHub**
-
-```bash
-docker build -t kaibad/message-board:latest .
-docker push kaibad/message-board:latest
-```
-
-**Step 5 — Deploy with Helm**
-
-```bash
-helm install message-board ./helm/message-board
-```
-
-**Step 6 — Get the external IP**
-
-```bash
-kubectl get svc flask-service
-```
-
-Visit the `EXTERNAL-IP` in your browser.
-
----
-
-### Full Project Flow
-
-```
-Code pushed to GitHub
-        ↓
-Docker builds image from Dockerfile
-        ↓
-Image pushed to DockerHub
-        ↓
-Helm installs chart on AWS EKS cluster
-        ↓
-K8s creates Pods (Flask + MySQL containers)
-        ↓
-LoadBalancer Service exposes Flask to internet
-        ↓
-Users access the Message Board
-```
-
----
-
-## Project Structure
-
-```
-message-board/
-├── app.py                  # Flask application
-├── requirements.txt        # Python dependencies
-├── message.sql             # Database schema
-├── Dockerfile              # Docker image instructions
-├── docker-compose.yml      # Multi-container local setup
-├── .env                    # Environment variables (not committed)
-├── .gitignore
-├── README.md
-├── nginx/
-│   └── nginx.conf          # Nginx reverse proxy config
-├── templates/
-│   └── index.html          # Frontend UI
-├── k8s/
-│   ├── storage/
-│   │   ├── pv.yaml
-│   │   └── pvc.yaml
-│   ├── app/
-│   │   ├── secret.yaml
-│   │   ├── mysql.yaml
-│   │   └── flask.yaml
-│   ├── hpa/
-│   │   └── hpa.yaml
-│   └── ingress/
-│       └── ingress.yaml
-└── helm/
-    └── message-board/
-        ├── Chart.yaml
-        ├── values.yaml
-        └── templates/
-```
 
 ---
 
